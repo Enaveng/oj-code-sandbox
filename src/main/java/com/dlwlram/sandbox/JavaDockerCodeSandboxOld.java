@@ -1,11 +1,14 @@
 package com.dlwlram.sandbox;
 
+import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.io.resource.ResourceUtil;
 import cn.hutool.core.util.ArrayUtil;
+import cn.hutool.core.util.StrUtil;
 import com.dlwlram.sandbox.model.ExecuteCodeRequest;
 import com.dlwlram.sandbox.model.ExecuteCodeResponse;
 import com.dlwlram.sandbox.model.ExecuteMessage;
 import com.dlwlram.sandbox.model.JudgeInfo;
+import com.dlwlram.sandbox.utils.RunProcessUtils;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.*;
@@ -20,22 +23,64 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 
 @Slf4j
 @Component
-public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
+public class JavaDockerCodeSandboxOld implements CodeSandBox {
 
-    private static boolean FIRST_INIT = false;
+    private static final String GLOBAL_CODE_DIR_NAME = "tmpCode";
+
+    private static final String GLOBAL_JAVA_CLASS_NAME = "Main.java";
 
     private static final long TIME_OUT = 5000L;
 
+    private static boolean FIRST_INIT = false;
+
     @Override
-    public List<ExecuteMessage> execCodeFile(ExecuteCodeRequest executeCodeRequest, File userCodeFile) {
-        String userCodeParentPath = userCodeFile.getParentFile().getAbsolutePath();
-        List<String> inputList = executeCodeRequest.getInputList();
+    public ExecuteCodeResponse executeCode(ExecuteCodeRequest executeCodeRequest) {
+        List<String> inputList = executeCodeRequest.getInputList();  //参数
+        String code = executeCodeRequest.getCode();
+        String language = executeCodeRequest.getLanguage();
+        //1.将用户的代码保存为文件
+        //先得到当前的工作目录
+        String userDir = System.getProperty("user.dir");
+        //不直接使用"/"拼接路径的原因是在Linux系统下的符号不同
+        /**
+         *  On UNIX systems the value of this field is '/'; on Microsoft Windows systems it is '\\'.
+         */
+        String globalCodePathName = userDir + File.separator + GLOBAL_CODE_DIR_NAME;//全局代码目录
+        //判断该目录是否存在 不存在则创建
+        if (FileUtil.exist(globalCodePathName)) {
+            FileUtil.mkdir(globalCodePathName);
+        }
+        //代码文件的父目录  目的是为了将每一个代码文件存储到不同的文件夹下 起到隔离作用
+        String userCodeParentPath = globalCodePathName + File.separator + UUID.randomUUID();
+        String userCodePath = userCodeParentPath + File.separator + GLOBAL_JAVA_CLASS_NAME;
+        //将代码内容写入到文件当中
+        File userCodeFile = FileUtil.writeString(code, userCodePath, StandardCharsets.UTF_8);
+
+        //2.编译代码 得到class文件
+        //Java操作命令行编译代码 参数为实际的命令
+        String compileCmd = String.format("javac -encoding utf-8 %s", userCodeFile.getAbsolutePath());
+        log.info(userCodeFile.getAbsolutePath());
+        log.info(userCodePath);
+        log.info(compileCmd);
+        log.info(userCodeParentPath);
+        try {
+            //得到的是一个进程
+            Process compileProcess = Runtime.getRuntime().exec(compileCmd);
+            ExecuteMessage executeMessage = RunProcessUtils.RunProcessAndGetMessage(compileProcess, "编译");
+            System.out.println(executeMessage);
+        } catch (Exception e) {
+            return getErrorResponse(e);
+        }
+
         //使用docker代码沙箱进行代码的执行
         //3.拉取jdk环境镜像
         DockerClient dockerClient = DockerClientBuilder.getInstance().build();
@@ -111,6 +156,7 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
                     timeOut[0] = false;
                     super.onComplete();
                 }
+
                 @Override
                 public void onNext(Frame frame) {
                     //判断输出的结果是错误结果还是正确结果
@@ -172,7 +218,45 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
             executeMessage.setMemory(maxMemory[0]);
             executeMessageList.add(executeMessage);
         }
-        return executeMessageList;
+
+        //拼接结果返回
+        ExecuteCodeResponse executeCodeResponse = new ExecuteCodeResponse();
+        long maxTime = 0;
+        long finalMemory = 0;
+        List<String> outputList = new ArrayList<>();
+        for (ExecuteMessage executeMessage : executeMessageList) {
+            String errorMessage = executeMessage.getErrorMessage();
+            if (StrUtil.isNotBlank(errorMessage)) {  //表示编译运行的过程当中存在错误
+                executeCodeResponse.setMessage(errorMessage);
+                executeCodeResponse.setStatus(3);
+                break;  //有一个错误就直接将此次判题确认为错误
+            }
+            Long time = executeMessage.getTime();
+            //取最大时间
+            if (time != null) {
+                maxTime = Math.max(maxTime, time);
+            }
+            //取最大占用内存
+            Long memory = executeMessage.getMemory();
+            finalMemory = Math.max(memory, finalMemory);
+            String successMessage = executeMessage.getSuccessMessage();
+            outputList.add(successMessage);
+        }
+        if (outputList.size() == executeMessageList.size()) {
+            executeCodeResponse.setStatus(1);
+        }
+        executeCodeResponse.setOutputList(outputList);
+        JudgeInfo judgeInfo = new JudgeInfo();
+        judgeInfo.setTime(maxTime);
+        judgeInfo.setMemory(finalMemory);
+        System.out.println(judgeInfo);
+        executeCodeResponse.setJudgeInfo(judgeInfo);
+        //防止在每次代码编译运行之后文件保留 导致服务器空间不足 需要删除代码目录
+        if (userCodeFile.getParentFile() != null) {
+            boolean del = FileUtil.del(userCodeParentPath);
+            System.out.println("删除" + (del ? "成功" : "失败"));
+        }
+        return executeCodeResponse;
     }
 
     /**
@@ -193,7 +277,7 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
 
     public static void main(String[] args) {
         //测试
-        JavaDockerCodeSandbox javaNativeCodeSandbox = new JavaDockerCodeSandbox();
+        JavaDockerCodeSandboxOld javaNativeCodeSandbox = new JavaDockerCodeSandboxOld();
         ExecuteCodeRequest executeCodeRequest = new ExecuteCodeRequest();
         executeCodeRequest.setInputList(Arrays.asList("1 2", "3 4"));
         //ResourceUtil.readStr会读取classPath路径下的文件

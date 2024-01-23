@@ -18,6 +18,7 @@ public class RunProcessUtils {
         ExecuteMessage executeMessage = new ExecuteMessage();
         try {
             StopWatch stopWatch = new StopWatch();
+            stopWatch.start();
             //等待命令执行完毕之后得到一个返回码
             int exitValue = compileProcess.waitFor();
             if (exitValue == 0) { //表示执行成功
@@ -51,11 +52,10 @@ public class RunProcessUtils {
                     errorStringBuilder.append(compileErrorOutputLine);
                 }
                 executeMessage.setExitValue(exitValue);
-                executeMessage.setSuccessMessage(stringBuilder.toString());
                 executeMessage.setErrorMessage(errorStringBuilder.toString());
-                executeMessage.setTime(stopWatch.getLastTaskTimeMillis());
-                stopWatch.stop();
             }
+            stopWatch.stop();
+            executeMessage.setTime(stopWatch.getLastTaskTimeMillis());
         } catch (Exception e) {
             e.printStackTrace();
         }
